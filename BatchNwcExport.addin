@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Скопировать в %AppData%\Autodesk\Revit\Addins\<версия>\
+  Assembly — полный путь к BatchNwcExport.dll
+-->
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Batch NWC Export</Name>
+    <Assembly>C:\BIMTools\BatchNwcExport\BatchNwcExport.dll</Assembly>
+    <AddInId>7C3E2A51-4B8D-4F2E-9A61-2D5B8E0F4C13</AddInId>
+    <FullClassName>BatchNwcExport.App</FullClassName>
+    <VendorId>BIMTOOLS</VendorId>
+    <VendorDescription>Batch export to Navisworks NWC from a named 3D view</VendorDescription>
+  </AddIn>
+</RevitAddIns>
