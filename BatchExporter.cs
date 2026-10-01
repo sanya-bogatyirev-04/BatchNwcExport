@@ -68,17 +68,17 @@ namespace BatchNwcExport
             }
 
             // Если модель уже открыта в этой сессии Revit — экспортируем из неё и не закрываем.
+            // Связи в ней не трогаем: это рабочая модель пользователя.
             Document doc = FindOpenDocument(path);
-            bool openedHere = false;
-
-            if (doc == null)
-            {
-                doc = OpenDetached(path);
-                openedHere = true;
-            }
+            bool openedHere = doc == null;
+            string tempDir = Path.Combine(Path.GetTempPath(), "BatchNwcExport", Guid.NewGuid().ToString("N"));
+            string warning = null;
 
             try
             {
+                if (openedHere)
+                    doc = OpenForExport(path, tempDir, out warning);
+
                 View3D view = FindView(doc);
 
                 if (view == null)
@@ -104,12 +104,16 @@ namespace BatchNwcExport
                 r.Success = true;
                 r.OutputPath = target;
                 r.Message = $"OK, {new FileInfo(target).Length / 1024.0 / 1024.0:F1} МБ";
+                if (warning != null)
+                    r.Message += ". " + warning;
                 return r;
             }
             finally
             {
-                if (openedHere && doc.IsValidObject)
+                if (openedHere && doc != null && doc.IsValidObject)
                     doc.Close(false);
+                if (openedHere)
+                    DeleteTempDir(tempDir);
             }
         }
 
@@ -130,14 +134,17 @@ namespace BatchNwcExport
         };
 
         /// <summary>
-        /// Метод для открытия модели, рабочие наборы сначала полностью закрыты, 
-        /// потом ищем связи и смотрим в каких рабочих наборах они лежат и 
-        /// потом открываем все рабочие наборы кроме найденных
+        /// Метод для открытия модели. Для моделей с рабочими наборами связи убираются до их загрузки:
+        /// открыть со всеми закрытыми наборами → удалить связи → сохранить во временный файл →
+        /// открыть его со всеми наборами. Открыть наборы в уже открытом документе Revit API не позволяет.
         /// </summary>
         /// <param name="path">Путь до модели</param>
+        /// <param name="tempDir">Папка для временного файла без связей</param>
+        /// <param name="warning">Предупреждение для лога, если часть связей удалить не удалось</param>
         /// <returns>Модель</returns>
-        private Document OpenDetached(string path)
+        private Document OpenForExport(string path, string tempDir, out string warning)
         {
+            warning = null;
             var modelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(path);
 
             if (!BasicFileInfo.Extract(path).IsWorkshared)
@@ -145,46 +152,108 @@ namespace BatchNwcExport
                 return _app.OpenDocumentFile(modelPath, new OpenOptions { Audit = false });
             }
 
-            // Проход 1: всё закрыто, связи не грузятся — только узнаём их рабочие наборы.
-            var linkWorksets = new HashSet<int>();
-            Document probe = _app.OpenDocumentFile(modelPath, DetachedOptions(new WorksetConfiguration(WorksetConfigurationOption.CloseAllWorksets)));
+            // Связи нужны в NWC или пользователь не просил открывать все наборы — открываем как есть.
+            if (_s.ExportLinks || !_s.OpenAllWorksets)
+            {
+                return OpenDetached(modelPath, _s.OpenAllWorksets ? WorksetConfigurationOption.OpenAllWorksets
+                                                                  : WorksetConfigurationOption.OpenLastViewed);
+            }
+
+            string tempFile = Path.Combine(tempDir, Path.GetFileName(path));
+            Document closed = OpenDetached(modelPath, WorksetConfigurationOption.CloseAllWorksets);
 
             try
             {
-                // можно искать id рабочих наборов с помощью имени но так наверное более правильнее
-                foreach (Element t in new FilteredElementCollector(probe).OfClass(typeof(RevitLinkType)))
-                {
-                    linkWorksets.Add(t.WorksetId.IntegerValue);
-                }
+                int failed = DelAllLinks(closed);
+                if (failed > 0)
+                    warning = $"Не удалось удалить связей: {failed}";
+
+                Directory.CreateDirectory(tempDir);
+                SaveAsTempCentral(closed, tempFile);
             }
             finally
             {
-                probe.Close(false);
+                if (closed.IsValidObject)
+                    closed.Close(false);
             }
 
-            // Проход 2: открываем все пользовательские наборы, кроме наборов со связями.
-            IList<WorksetId> toOpen = WorksharingUtils.GetUserWorksetInfo(modelPath)
-                                                      .Select(w => w.Id)
-                                                      .Where(id => !linkWorksets.Contains(id.IntegerValue))
-                                                      .ToList();
-
-            var cfg = new WorksetConfiguration(WorksetConfigurationOption.CloseAllWorksets);
-            cfg.Open(toOpen);
-
-            return _app.OpenDocumentFile(modelPath, DetachedOptions(cfg));
+            return OpenDetached(ModelPathUtils.ConvertUserVisiblePathToModelPath(tempFile),
+                                WorksetConfigurationOption.OpenAllWorksets);
         }
 
-        private static OpenOptions DetachedOptions(WorksetConfiguration cfg)
+        /// <summary>Удаляет все связи RVT. Возвращает количество связей, которые удалить не удалось.</summary>
+        public int DelAllLinks(Document doc)
+        {
+            // Экземпляры удаляются вместе с типом; вложенные связи уходят вместе с родительской.
+            List<ElementId> linkTypeIds = new FilteredElementCollector(doc)
+                .OfClass(typeof(RevitLinkType))
+                .Cast<RevitLinkType>()
+                .Where(l => !l.IsNestedLink)
+                .Select(l => l.Id)
+                .ToList();
+
+            if (linkTypeIds.Count == 0)
+                return 0;
+
+            int failed = 0;
+            using (Transaction tx = new Transaction(doc))
+            {
+                tx.Start("Удаление связей");
+
+                foreach (ElementId id in linkTypeIds)
+                {
+                    try
+                    {
+                        doc.Delete(id);
+                    }
+                    catch
+                    {
+                        failed++;
+                    }
+                }
+
+                tx.Commit();
+            }
+
+            return failed;
+        }
+
+        private static void SaveAsTempCentral(Document doc, string tempFile)
+        {
+            var options = new SaveAsOptions { OverwriteExistingFile = true, MaximumBackups = 1 };
+
+            // Отсоединённую модель с сохранёнными рабочими наборами можно сохранить только как новый ФХ.
+            options.SetWorksharingOptions(new WorksharingSaveAsOptions
+            {
+                SaveAsCentral = true,
+                OpenWorksetsDefault = SimpleWorksetConfiguration.AllWorksets
+            });
+
+            doc.SaveAs(ModelPathUtils.ConvertUserVisiblePathToModelPath(tempFile), options);
+        }
+
+        private static void DeleteTempDir(string tempDir)
+        {
+            try
+            {
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, true);
+            }
+            catch { /* временные файлы не должны ронять экспорт */ }
+        }
+
+        private Document OpenDetached(ModelPath modelPath, WorksetConfigurationOption worksets)
         {
             var opts = new OpenOptions
             {
                 Audit = false,
+                // Отсоединяем от ФХ: центральная модель не блокируется и не синхронизируется.
                 DetachFromCentralOption = DetachFromCentralOption.DetachAndPreserveWorksets
             };
 
-            opts.SetOpenWorksetsConfiguration(cfg);
+            opts.SetOpenWorksetsConfiguration(new WorksetConfiguration(worksets));
 
-            return opts;
+            return _app.OpenDocumentFile(modelPath, opts);
         }
 
         private Document FindOpenDocument(string path)
